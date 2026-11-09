@@ -8,29 +8,34 @@ import java.net.URL
 class ClaudeClient(private val apiKey: String) {
 
     companion object {
-        // Tezroq va arzonroq model. Xohlasangiz "claude-sonnet-5-5" ga almashtiring.
-        const val MODEL = "claude-haiku-5-5"
+        const val CLAUDE_MODEL = "claude-haiku-5-5"
+        const val GEMINI_MODEL = "gemini-flash-latest"
     }
 
-    fun chat(system: String, messages: JSONArray): String {
-        val body = JSONObject()
-            .put("model", MODEL)
-            .put("max_tokens", 1024)
-            .put("system", system)
-            .put("messages", messages)
-        val conn = URL("https://api.anthropic.com/v1/messages").openConnection() as HttpURLConnection
+    fun chat(system: String, messages: JSONArray): String =
+        if (apiKey.startsWith("sk-ant")) claude(system, messages) else gemini(system, messages)
+
+    private fun post(url: String, headers: Map<String, String>, body: JSONObject): String {
+        val conn = URL(url).openConnection() as HttpURLConnection
         conn.requestMethod = "POST"
         conn.connectTimeout = 15000
         conn.readTimeout = 60000
         conn.doOutput = true
         conn.setRequestProperty("content-type", "application/json")
-        conn.setRequestProperty("x-api-key", apiKey)
-        conn.setRequestProperty("anthropic-version", "2023-06-01")
+        for ((k, v) in headers) conn.setRequestProperty(k, v)
         conn.outputStream.use { it.write(body.toString().toByteArray()) }
         val code = conn.responseCode
         val stream = if (code in 200..299) conn.inputStream else conn.errorStream
         val text = stream.bufferedReader().use { it.readText() }
         if (code !in 200..299) throw RuntimeException("API $code: ${text.take(200)}")
+        return text
+    }
+
+    private fun claude(system: String, messages: JSONArray): String {
+        val body = JSONObject().put("model", CLAUDE_MODEL).put("max_tokens", 1024)
+            .put("system", system).put("messages", messages)
+        val text = post("https://api.anthropic.com/v1/messages",
+            mapOf("x-api-key" to apiKey, "anthropic-version" to "2023-06-01"), body)
         val content = JSONObject(text).getJSONArray("content")
         val sb = StringBuilder()
         for (i in 0 until content.length()) {
@@ -39,4 +44,15 @@ class ClaudeClient(private val apiKey: String) {
         }
         return sb.toString()
     }
-}
+
+    private fun gemini(system: String, messages: JSONArray): String {
+        val contents = JSONArray()
+        for (i in 0 until messages.length()) {
+            val m = messages.getJSONObject(i)
+            val role = if (m.getString("role") == "assistant") "model" else "user"
+            contents.put(JSONObject().put("role", role).put("parts",
+                JSONArray().put(JSONObject().put("text", m.getString("content")))))
+        }
+        val body = JSONObject()
+            .put("systemInstruction", JSONObject().put("parts",
+                JSONArray().put(J
