@@ -55,4 +55,16 @@ class ClaudeClient(private val apiKey: String) {
         }
         val body = JSONObject()
             .put("systemInstruction", JSONObject().put("parts",
-                JSONArray().put(J
+                JSONArray().put(JSONObject().put("text", system))))
+            .put("contents", contents)
+            .put("generationConfig", JSONObject().put("responseMimeType", "application/json"))
+        val text = post(
+            "https://generativelanguage.googleapis.com/v1beta/models/$GEMINI_MODEL:generateContent",
+            mapOf("x-goog-api-key" to apiKey), body)
+        val parts = JSONObject(text).getJSONArray("candidates").getJSONObject(0)
+            .getJSONObject("content").getJSONArray("parts")
+        val sb = StringBuilder()
+        for (i in 0 until parts.length()) sb.append(parts.getJSONObject(i).optString("text"))
+        return sb.toString()
+    }
+}
