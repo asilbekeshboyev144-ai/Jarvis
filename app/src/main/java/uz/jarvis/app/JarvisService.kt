@@ -1,8 +1,5 @@
 package uz.jarvis.app
 
-import ai.picovoice.porcupine.Porcupine
-import ai.picovoice.porcupine.PorcupineManager
-import ai.picovoice.porcupine.PorcupineManagerCallback
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -20,6 +17,7 @@ import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
+import android.widget.Toast
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Locale
@@ -34,6 +32,13 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         private const val TAG = "Jarvis"
         private const val CHANNEL = "jarvis"
         private const val TTS_LANG = "en"
+        private const val WAKE_LANG = "en-US"   // "Jarvis" so'zini tinglash tili
+        private const val CMD_LANG = "uz-UZ"    // buyruq tili
+
+        private val WAKE_WORDS = listOf(
+            "jarvis", "jarviz", "jarvish", "jarvas", "charvis", "gervis",
+            "жарвис", "джарвис", "жарвиз", "джарвиз"
+        )
 
         private val SYSTEM = """
 Sen JARVIS — foydalanuvchining Android telefonidagi ovozli yordamchisan. Foydalanuvchi o'zbek tilida gapiradi (ba'zan rus yoki ingliz tilida).
@@ -50,16 +55,26 @@ Qoidalar:
 """.trim()
     }
 
+    private abstract class Listener : RecognitionListener {
+        override fun onReadyForSpeech(params: Bundle?) {}
+        override fun onBeginningOfSpeech() {}
+        override fun onRmsChanged(rmsdB: Float) {}
+        override fun onBufferReceived(buffer: ByteArray?) {}
+        override fun onEndOfSpeech() {}
+        override fun onPartialResults(partialResults: Bundle?) {}
+        override fun onEvent(eventType: Int, params: Bundle?) {}
+    }
+
     private val main = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor()
     private val doneCallbacks = ConcurrentHashMap<String, () -> Unit>()
-    private var porcupine: PorcupineManager? = null
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private var recognizer: SpeechRecognizer? = null
     private lateinit var actions: Actions
     private lateinit var claude: ClaudeClient
     @Volatile private var busy = false
+    @Volatile private var wakeActive = false
 
     override fun onBind(intent: Intent?): IBinder? = null
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int) = START_STICKY
@@ -71,7 +86,9 @@ Qoidalar:
         actions = Actions(this)
         claude = ClaudeClient(prefs.getString("claude", "") ?: "")
         tts = TextToSpeech(this, this)
-        startWakeWord(prefs.getString("picovoice", "") ?: "")
+        wakeActive = true
+        note("Tinglayapman: Jarvis deng", false)
+        main.post { listenWake() }
     }
 
     private fun startInForeground() {
@@ -88,54 +105,97 @@ Qoidalar:
         else startForeground(1, n)
     }
 
-    private fun startWakeWord(key: String) {
-        try {
-            porcupine = PorcupineManager.Builder()
-                .setAccessKey(key)
-                .setKeyword(Porcupine.BuiltInKeyword.JARVIS)
-                .build(this, PorcupineManagerCallback { onWake() })
-            porcupine?.start()
-        } catch (e: Exception) {
-            Log.e(TAG, "Porcupine xatosi", e)
-            speak("Uyg'onish so'zi ishlamadi. Picovoice kalitni tekshiring.")
+    // Holatni bildirishnomada (va ba'zan toast sifatida) ko'rsatadi: ovoz bo'lmasa ham ko'rinadi.
+    private fun note(msg: String, toast: Boolean = true) {
+        Log.d(TAG, msg)
+        main.post {
+            try {
+                val n = Notification.Builder(this, CHANNEL)
+                    .setContentTitle("Jarvis")
+                    .setContentText(msg)
+                    .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                    .build()
+                getSystemService(NotificationManager::class.java).notify(1, n)
+                if (toast) Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+            } catch (_: Exception) {}
         }
+    }
+
+    private fun recIntent(lang: String, partial: Boolean) =
+        Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+            .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            .putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang)
+            .putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, partial)
+
+    // ---- "Jarvis" so'zini doim tinglash ----
+    private fun listenWake() {
+        if (!wakeActive || busy) return
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            wakeActive = false
+            speak("Speech service not found")
+            return
+        }
+        recognizer?.destroy()
+        val r = SpeechRecognizer.createSpeechRecognizer(this)
+        recognizer = r
+        r.setRecognitionListener(object : Listener() {
+            override fun onPartialResults(partialResults: Bundle?) { checkWake(partialResults) }
+            override fun onResults(results: Bundle?) {
+                if (!checkWake(results)) restartWake(250L)
+            }
+            override fun onError(error: Int) {
+                when (error) {
+                    SpeechRecognizer.ERROR_NO_MATCH,
+                    SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> restartWake(250L)
+                    SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
+                        wakeActive = false
+                        speak("Microphone permission is missing")
+                    }
+                    else -> { note("Tinglash xatosi: $error"); restartWake(1500L) }
+                }
+            }
+        })
+        r.startListening(recIntent(WAKE_LANG, true))
+    }
+
+    private fun restartWake(delayMs: Long) {
+        main.postDelayed({ listenWake() }, delayMs)
+    }
+
+    private fun checkWake(b: Bundle?): Boolean {
+        val list = b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) ?: return false
+        list.firstOrNull()?.let { note("Eshitdim: $it", false) }
+        val hit = list.any { s ->
+            val t = s.lowercase()
+            WAKE_WORDS.any { t.contains(it) }
+        }
+        if (hit) onWake()
+        return hit
     }
 
     private fun onWake() {
         if (busy) return
         busy = true
         main.post {
-            try { porcupine?.stop() } catch (_: Exception) {}
-            speak("Eshitaman") { listen() }
+            try { recognizer?.destroy() } catch (_: Exception) {}
+            recognizer = null
+            note("Jarvis eshitildi!")
+            speak("Eshitaman") { listenCommand() }
         }
     }
 
-    private fun listen() {
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            speak("Ovozni tanish xizmati topilmadi") { finishCycle() }
-            return
-        }
+    private fun listenCommand() {
         recognizer?.destroy()
-        recognizer = SpeechRecognizer.createSpeechRecognizer(this).apply {
-            setRecognitionListener(object : RecognitionListener {
-                override fun onResults(results: Bundle?) {
-                    val t = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
-                    if (t.isNullOrBlank()) finishCycle() else handle(t)
-                }
-                override fun onError(error: Int) { finishCycle() }
-                override fun onReadyForSpeech(params: Bundle?) {}
-                override fun onBeginningOfSpeech() {}
-                override fun onRmsChanged(rmsdB: Float) {}
-                override fun onBufferReceived(buffer: ByteArray?) {}
-                override fun onEndOfSpeech() {}
-                override fun onPartialResults(partialResults: Bundle?) {}
-                override fun onEvent(eventType: Int, params: Bundle?) {}
-            })
-        }
-        val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
-            .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "uz-UZ")
-        recognizer?.startListening(i)
+        val r = SpeechRecognizer.createSpeechRecognizer(this)
+        recognizer = r
+        r.setRecognitionListener(object : Listener() {
+            override fun onResults(results: Bundle?) {
+                val t = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                if (t.isNullOrBlank()) finishCycle() else { note("Buyruq: $t"); handle(t) }
+            }
+            override fun onError(error: Int) { note("Buyruq tinglash xatosi: $error"); finishCycle() }
+        })
+        r.startListening(recIntent(CMD_LANG, false))
     }
 
     private fun handle(command: String) {
@@ -146,9 +206,10 @@ Qoidalar:
     }
 
     private fun finishCycle() {
-        recognizer?.destroy(); recognizer = null
+        try { recognizer?.destroy() } catch (_: Exception) {}
+        recognizer = null
         busy = false
-        try { porcupine?.start() } catch (e: Exception) { Log.e(TAG, "restart", e) }
+        restartWake(500L)
     }
 
     private fun screen() =
@@ -176,10 +237,11 @@ Qoidalar:
                 msgs.put(JSONObject().put("role", "user")
                     .put("content", "Natija:\n$results\nHozirgi ekran:\n${screen()}"))
             }
-            speakBlocking("Vazifa juda uzoq davom etdi, to'xtatdim")
+            speakBlocking("The task took too long, I stopped")
         } catch (e: Exception) {
             Log.e(TAG, "agent", e)
-            speakBlocking("Xatolik yuz berdi")
+            note("Xato: ${e.message?.take(90)}")
+            speakBlocking("An error occurred")
         }
     }
 
@@ -195,7 +257,7 @@ Qoidalar:
     // ---- TTS ----
     override fun onInit(status: Int) {
         val t = tts ?: return
-        if (status != TextToSpeech.SUCCESS) return
+        if (status != TextToSpeech.SUCCESS) { note("Ovoz xizmati ishga tushmadi (kod $status)"); return }
         t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {}
             override fun onDone(utteranceId: String?) { fire(utteranceId) }
@@ -203,10 +265,9 @@ Qoidalar:
             override fun onError(utteranceId: String?) { fire(utteranceId) }
         })
         fun ok(r: Int) = r != TextToSpeech.LANG_MISSING_DATA && r != TextToSpeech.LANG_NOT_SUPPORTED
-        // Javob o'zbekcha yoziladi, lekin INGLIZ ovozi o'qiydi.
-        // Boshqa ovoz kerak bo'lsa, TTS_LANG ni o'zgartiring: "uz", "tr", "ru"...
         if (!ok(t.setLanguage(Locale(TTS_LANG)))) t.setLanguage(Locale.getDefault())
         ttsReady = true
+        note("Ovoz tayyor", false)
     }
 
     private fun fire(id: String?) {
@@ -229,8 +290,9 @@ Qoidalar:
     }
 
     override fun onDestroy() {
-        try { porcupine?.stop(); porcupine?.delete() } catch (_: Exception) {}
-        recognizer?.destroy()
+        wakeActive = false
+        main.removeCallbacksAndMessages(null)
+        try { recognizer?.destroy() } catch (_: Exception) {}
         tts?.shutdown()
         worker.shutdownNow()
         super.onDestroy()
